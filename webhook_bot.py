@@ -9,6 +9,11 @@ import itertools
 import time
 from datetime import datetime
 
+# --- NEW IMPORTS FOR RENDER WORKAROUND ---
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import os
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
@@ -42,12 +47,33 @@ xgb_model = xgb.Booster()
 xgb_model.load_model('xgb_binary_model.json')
 
 # ==========================================
-# 2. FETCH LIVE DATA WITH PROXY ROTATION
+# 2. DUMMY WEB SERVER (RENDER WORKAROUND)
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Respond with HTTP 200 OK to keep Render happy
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Crypto Bot is up and running!")
+
+    # Suppress server logging to keep your console clean
+    def log_message(self, format, *args):
+        pass
+
+def keep_alive_server():
+    # Render assigns a port dynamically via the PORT env variable
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"🌐 Started dummy web server on port {port} to satisfy Render.")
+    server.serve_forever()
+
+# ==========================================
+# 3. FETCH LIVE DATA WITH PROXY ROTATION
 # ==========================================
 def fetch_latest_data(symbol, timeframe, limit):
     print(f"📡 Fetching latest {limit} candles for {symbol}...")
     
-    # Try up to the total number of proxies before giving up
     for _ in range(len(PROXY_LIST)):
         current_proxy = next(proxy_pool)
         print(f"🔄 Attempting connection via proxy: {current_proxy.split('@')[-1]}")
@@ -73,13 +99,12 @@ def fetch_latest_data(symbol, timeframe, limit):
             
         except Exception as e:
             print(f"⚠️ Proxy failed ({type(e).__name__}): {e}")
-            time.sleep(1.5)  # Brief pause before hitting the next proxy
+            time.sleep(1.5)
             
-    # If the loop finishes without returning, all proxies failed
     raise Exception("❌ All proxies failed. Could not fetch live market data.")
 
 # ==========================================
-# 3. FEATURE ENGINEERING
+# 4. FEATURE ENGINEERING
 # ==========================================
 def engineer_features(df):
     print("📊 Calculating indicators...")
@@ -116,7 +141,6 @@ def engineer_features(df):
     direction = np.sign(df['close'] - df['open'])
     df['consecutive_trend'] = direction.groupby((direction != direction.shift()).cumsum()).cumsum()
 
-    # Stationary sequence features
     df['ret_close'] = df['close'].pct_change() * 100
     df['ret_high'] = ((df['high'] - df['close'].shift()) / df['close'].shift()) * 100
     df['ret_low'] = ((df['low'] - df['close'].shift()) / df['close'].shift()) * 100
@@ -128,7 +152,7 @@ def engineer_features(df):
     return df
 
 # ==========================================
-# 4. PREDICTION PIPELINE
+# 5. PREDICTION PIPELINE
 # ==========================================
 def get_prediction(df):
     seq_length = 5
@@ -141,13 +165,9 @@ def get_prediction(df):
     
     last_idx = len(df) - 1
     
-    # Extract the last 5 rows for the LSTM sequence
     X_seq_live = df[['ret_close', 'ret_high', 'ret_low', 'vol_pct', 'atr']].values[last_idx-seq_length+1:last_idx+1].reshape(1, seq_length, 5)
-    
-    # Extract the last row for tabular features
     X_tab_live = df[tabular_columns].values[last_idx].reshape(1, len(tabular_columns))
     
-    # Infer
     lstm_feat_live = lstm_model.predict(X_seq_live, verbose=0)
     X_combined_live = np.hstack((lstm_feat_live, X_tab_live))
     
@@ -158,72 +178,78 @@ def get_prediction(df):
     return action, probability
 
 # ==========================================
-# 5. DISCORD WEBHOOK
+# 6. DISCORD WEBHOOK
 # ==========================================
 def send_discord_webhook(action, probability, current_price, atr_value, atr_ma):
-    
-    # Market Choppiness Analysis
     if atr_value > atr_ma:
         choppiness_status = "Less Choppy (Trend favorable)"
         color = 0x00FF00 if action == "LONG" else 0xFFFF00
     else:
         choppiness_status = "More Choppy (Range bound)"
-        color = 0xFFA500  # Orange warning
+        color = 0xFFA500
         
     embed = {
         "title": f"🤖 5m Bot Prediction Update | {SYMBOL}",
-        "description": f"New candle closed. Here is the latest model evaluation.",
+        "description": f"New candle closing in 30 seconds. Here is the latest model evaluation.",
         "color": color,
         "fields": [
-            {
-                "name": "🎯 Signal",
-                "value": f"**{action}**",
-                "inline": True
-            },
-            {
-                "name": "📊 Confidence",
-                "value": f"{(probability * 100):.2f}%",
-                "inline": True
-            },
-            {
-                "name": "💰 Current Price",
-                "value": f"${current_price:.4f}",
-                "inline": True
-            },
-            {
-                "name": "🌊 Market State",
-                "value": choppiness_status,
-                "inline": False
-            }
+            {"name": "🎯 Signal", "value": f"**{action}**", "inline": True},
+            {"name": "📊 Confidence", "value": f"{(probability * 100):.2f}%", "inline": True},
+            {"name": "💰 Current Price", "value": f"${current_price:.4f}", "inline": True},
+            {"name": "🌊 Market State", "value": choppiness_status, "inline": False}
         ],
         "footer": {
             "text": f"Threshold set at {(THRESHOLD * 100):.1f}% | Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
         }
     }
     
-    data = {
-        "embeds": [embed]
-    }
-    
-    response = requests.post(DISCORD_WEBHOOK_URL, json=data)
-    if response.status_code == 204:
-        print("✅ Webhook sent successfully!")
-    else:
-        print(f"❌ Failed to send webhook. Code: {response.status_code}, Response: {response.text}")
+    requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+    print("✅ Webhook executed.")
 
 # ==========================================
-# EXECUTION
+# 7. CONTINUOUS EXECUTION LOOP
 # ==========================================
+def run_bot():
+    print("🚀 Bot initialized. Entering monitoring phase...")
+    while True:
+        current_timestamp = int(datetime.utcnow().timestamp())
+        
+        # Calculate next 5-minute close and subtract 30 seconds
+        next_candle_close = ((current_timestamp // 300) + 1) * 300
+        target_timestamp = next_candle_close - 30
+        
+        sleep_duration = target_timestamp - current_timestamp
+        
+        if sleep_duration <= 0:
+            sleep_duration += 300
+            target_timestamp += 300
+
+        target_time_str = datetime.utcfromtimestamp(target_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"⏳ Sleeping for {sleep_duration} seconds... Waking up at {target_time_str} UTC")
+        
+        time.sleep(sleep_duration)
+        print("⏰ Waking up! 30 seconds to candle close. Executing pipeline...")
+        
+        try:
+            df_live = fetch_latest_data(SYMBOL, TIMEFRAME, LIMIT)
+            df_live = engineer_features(df_live)
+            
+            action, prob = get_prediction(df_live)
+            
+            current_price = df_live['close'].iloc[-1]
+            current_atr = df_live['atr'].iloc[-1]
+            atr_ma = df_live['atr'].rolling(14).mean().iloc[-1]
+            
+            send_discord_webhook(action, prob, current_price, current_atr, atr_ma)
+            
+        except Exception as e:
+            print(f"❌ Error during execution: {e}")
+            print("🔄 Loop continuing... Will try again next epoch.")
+
 if __name__ == "__main__":
-    df_live = fetch_latest_data(SYMBOL, TIMEFRAME, LIMIT)
-    df_live = engineer_features(df_live)
+    # 1. Start the dummy web server in a background thread
+    server_thread = threading.Thread(target=keep_alive_server, daemon=True)
+    server_thread.start()
     
-    action, prob = get_prediction(df_live)
-    
-    current_price = df_live['close'].iloc[-1]
-    current_atr = df_live['atr'].iloc[-1]
-    
-    # Calculate an ATR moving average to determine relative choppiness
-    atr_ma = df_live['atr'].rolling(14).mean().iloc[-1]
-    
-    send_discord_webhook(action, prob, current_price, current_atr, atr_ma)
+    # 2. Run the main trading loop
+    run_bot()
