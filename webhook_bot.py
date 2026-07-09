@@ -12,7 +12,39 @@ from datetime import datetime
 # --- NEW IMPORTS FOR RENDER WORKAROUND ---
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+from supabase import create_client, Client
 import os
+
+# Initialize Supabase
+SUPABASE_URL = "https://bpizkikscieyhzajrrrg.supabase.co"
+SUPABASE_KEY = "sb_publishable_UwkvMmq91Y5jS1PEJ9IE_w_vN5-JWUP"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def log_prediction_to_supabase(action, probability, price):
+    # Insert initial prediction
+    data = supabase.table("bot_predictions").insert({
+        "timestamp": int(datetime.now(timezone.utc).timestamp()),
+        "price": float(price),
+        "prediction": action,
+        "probability": float(probability),
+        "status": "pending" 
+    }).execute()
+    return data.data[0]['id'] # Returns the ID to update later
+
+def resolve_prediction(pred_id, entry_price):
+    # Fetch price after 5 minutes
+    df_new = fetch_latest_data(SYMBOL, TIMEFRAME, 2)
+    exit_price = df_new['close'].iloc[-1]
+    
+    # Logic: If predicted LONG and price > entry_price, it's a WIN
+    is_win = exit_price > entry_price
+    
+    supabase.table("bot_predictions").update({
+        "status": "resolved",
+        "result": "win" if is_win else "loss",
+        "exit_price": float(exit_price)
+    }).eq("id", pred_id).execute()
+    print(f"✅ Prediction {pred_id} resolved! Result: {'WIN' if is_win else 'LOSS'}")
 
 # ==========================================
 # CONFIGURATION
@@ -235,12 +267,23 @@ def run_bot():
             df_live = engineer_features(df_live)
             
             action, prob = get_prediction(df_live)
-            
+
             current_price = df_live['close'].iloc[-1]
             current_atr = df_live['atr'].iloc[-1]
             atr_ma = df_live['atr'].rolling(14).mean().iloc[-1]
             
             send_discord_webhook(action, prob, current_price, current_atr, atr_ma)
+
+            # 1. Log the prediction
+            pred_id = log_prediction_to_supabase(action, prob, current_price)
+            send_discord_webhook(action, prob, current_price, ...)
+            
+            # 2. Wait 5 minutes to resolve it
+            print("⏳ Waiting 5 minutes to resolve prediction...")
+            time.sleep(300) 
+            
+            # 3. Update Supabase
+            resolve_prediction(pred_id, current_price)
             
         except Exception as e:
             print(f"❌ Error during execution: {e}")
