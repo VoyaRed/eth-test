@@ -1,0 +1,16 @@
+{
+  "name": "crypto-updown-backtester",
+  "version": "1.0.0",
+  "description": "Historical forward-testing engine for Crypto.com UpDown Options",
+  "main": "backtester_2.js",
+  "scripts": {
+    "start": "node backtester_2.js"
+  },
+  "dependencies": {
+    "ccxt": "^4.2.0",
+    "impit": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
